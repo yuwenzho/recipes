@@ -912,8 +912,14 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
   // own `strategies` allowlist; Mooncake needs scalable hardware not opted
   // out by the recipe.
   const kvOffloadOptions = taxonomy.kv_offload || {};
+  // Intel XPU: no KV-offload layer is validated on this backend, so force the
+  // effective selection to Off regardless of a persisted pick from other
+  // hardware (keeps the generated command a plain single-instance serve).
+  const kvOffloadDisabledByHw = hwProfile?.generation === "xpu";
   const activeKvOffload =
-    kvOffloadOptions[kvOffload]
+    kvOffloadDisabledByHw
+      ? ""
+      : kvOffloadOptions[kvOffload]
       ? (isKvOffloadAllowedForStrategy(kvOffloadOptions[kvOffload], activeServingStrategy, strategies[activeServingStrategy]) ? kvOffload : "")
       : compatibleKvStoreStrategies.includes(kvOffload) && hwScalable
           && isKvStoreBrandSupported(hwProfile) && isKvStoreSupported(kvOffload)
@@ -954,6 +960,10 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
     nodeCount === 1 && activeStrategy === "single_node_tp" && effectiveTp < hwGpuCount;
 
   const isSingleNode = nodeCount === 1 && typeof activeStrategy === "string" && activeStrategy.startsWith("single_node_");
+  // Intel XPU: the validated deployment is single-node, single-instance vLLM in
+  // the official Docker image. KV-offload layers (Simple / LMCache / Mooncake)
+  // and multi-node clustering aren't validated on this backend, so gate them off.
+  const isXpuHardware = hwProfile?.generation === "xpu";
   const needGb = currentVariant?.vram_minimum_gb;
   const availGb = hwProfile.vram_gb;
   const vramShortfall =
@@ -1142,8 +1152,9 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
     const recipeDefault = recipe.default_strategy;
     const recipeDefaultsSingleNode =
       typeof recipeDefault === "string" && recipeDefault.startsWith("single_node_");
-    const shouldBumpNodes = nodeCount === 1 && supportsMultiNode && newScalable && !fitsNew;
-    const shouldUnbumpNodes = nodeCount > 1 && (!newScalable || (fitsNew && recipeDefaultsSingleNode));
+    const shouldBumpNodes = nodeCount === 1 && supportsMultiNode && newScalable && !fitsNew && newProfile?.generation !== "xpu";
+    // Intel XPU is validated single-node only — always clamp back to 1 node.
+    const shouldUnbumpNodes = nodeCount > 1 && (!newScalable || newProfile?.generation === "xpu" || (fitsNew && recipeDefaultsSingleNode));
     if (shouldBumpNodes) setNodeCount(2);
     if (shouldUnbumpNodes) setNodeCount(1);
     syncUrl({
@@ -1598,7 +1609,9 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
   // the Install tab *and* the rendered command block to docker — they stay
   // in sync without requiring the user to re-click.
   const pipEffectivelyHidden =
-    recipe.model?.install?.pip === false || hwProfile?.generation === "tpu";
+    recipe.model?.install?.pip === false ||
+    hwProfile?.generation === "tpu" ||
+    hwProfile?.generation === "xpu";
   const dockerEffectivelyHidden = recipe.model?.install?.docker === false;
   const effectiveInstallMode =
     installMode === "pip" && pipEffectivelyHidden
@@ -2098,10 +2111,12 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
                 // joins the same ordered list at MOONCAKE_PILL_ORDER, so the
                 // row reads Off · Simple · Mooncake · LMCache.
                 const pills = Object.entries(kvOffloadOptions).map(([key, opt]) => {
-                  const allowed = isKvOffloadAllowedForStrategy(opt, activeServingStrategy, strategies[activeServingStrategy]);
+                  const allowed = !isXpuHardware && isKvOffloadAllowedForStrategy(opt, activeServingStrategy, strategies[activeServingStrategy]);
                   // Say WHY it's disabled and what would enable it, not just
                   // "not available" — the allowlist gives us the answer.
-                  const disabledTitle = activeServingStrategy === "pd_cluster"
+                  const disabledTitle = isXpuHardware
+                    ? `${opt.display_name || key} isn't validated on Intel XPU — serve directly with the Docker image.`
+                    : activeServingStrategy === "pd_cluster"
                     ? `${opt.display_name || key} can't compose with PD cluster, which owns --kv-transfer-config. (Mooncake composes with PD instead.)`
                     : `${opt.display_name || key} works with: ${(opt.strategies || []).map((s) => strategies[s]?.display_name || s).join(", ")}.`;
                   return {
@@ -2127,9 +2142,11 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
                   // extra store process).
                   const supported = compatibleKvStoreStrategies.filter((s) => isKvStoreSupported(s));
                   const brandOk = isKvStoreBrandSupported(hwProfile);
-                  const selectable = hwScalable && brandOk && supported.length > 0;
+                  const selectable = !isXpuHardware && hwScalable && brandOk && supported.length > 0;
                   const defaultId = supported[0];
-                  const disabledTitle = !brandOk
+                  const disabledTitle = isXpuHardware
+                    ? "Mooncake isn't validated on Intel XPU — serve directly with the Docker image."
+                    : !brandOk
                     ? `Mooncake's transfer engine ships CUDA and ROCm builds only — not available on ${hwProfile.brand || ""} ${hwProfile.display_name || hwId} backends.`
                     : !hwScalable
                       ? `${hwProfile.display_name || "This hardware"} is a single-GPU workstation and can't run a multi-node KV-store deployment.`
@@ -2292,7 +2309,7 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
                   // multi_node_* (or pd_cluster) strategy (small dense models
                   // commonly omit these), or when the active hardware can't be
                   // clustered (single-GPU workstation, e.g. DGX Station).
-                  const noMultiNode = n > 1 && (!supportsMultiNode || !hwScalable);
+                  const noMultiNode = n > 1 && (!supportsMultiNode || !hwScalable || isXpuHardware);
                   // Single-node pill is disabled when the variant can't fit on
                   // one node of the selected hardware — same struck-through
                   // treatment as unsupported hardware pills. Multi-node still
@@ -2308,7 +2325,9 @@ export function CommandBuilder({ recipe, strategies, taxonomy }) {
                       onClick={() => !disabled && selectNodes(n)}
                       title={
                         noMultiNode
-                          ? !hwScalable
+                          ? isXpuHardware
+                            ? "Multi-node clustering isn't validated on Intel XPU — serve single-node with the Docker image."
+                            : !hwScalable
                             ? `${hwProfile.display_name || "This hardware"} is a single-GPU workstation and can't be clustered into multiple nodes.`
                             : "This recipe does not declare a multi-node strategy. Fits in a single node."
                           : singleNodeDoesntFit
@@ -2693,13 +2712,20 @@ function CommandTabs({ tabs, current, onSelect }) {
 
 function SingleCommandBlock({ command, env, companions, verifyCmd, benchCmd, statusHeader, installMode, dockerMeta, configSummary, endpointsControls }) {
   const [tab, setTab] = useState("vllm");
+  // The `docker pull` for the image lives in the Install block above.
+  const isXpu = !!dockerMeta?.isXpu;
   const isDocker = installMode === "docker";
   // Docker mode: env vars fold into `-e` flags inside the wrapped `docker run`,
   // so there's no separate prelude (the `docker pull` lives in the Install
   // block tabs above). Pip mode: prelude = `export KEY=VAL` lines.
-  const prelude = isDocker ? "" : envToExports(env);
+  const preludeBase = isDocker ? "" : envToExports(env);
+  // XPU pip mode sources oneAPI on the host first; in docker mode the wrapper
+  // sources it inside the container, so no host prelude is needed.
+  const prelude = isXpu && !isDocker
+    ? ["source /opt/intel/oneapi/setvars.sh", preludeBase].filter(Boolean).join("\n")
+    : preludeBase;
   const displayCommand = isDocker
-    ? buildDockerRun({ command, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+    ? buildDockerRun({ command, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, isXpu: dockerMeta.isXpu })
     : command;
   // A companion process may ride along (`companions[]` from resolveCommand —
   // a feature's `companion:` or the active kv_offload option's, e.g.
@@ -2828,7 +2854,7 @@ function InstallBlock({ recipe, variant, dockerMeta, installMode, setInstallMode
   const pipHidden = pipCfg === false;
   const dockerHidden = dockerCfg === false;
   const [open, setOpen] = useState(false);
-  const { isAmd, isTpu, image: dockerImage, brandKey, cudaMap } = dockerMeta;
+  const { isAmd, isTpu, isXpu, image: dockerImage, brandKey, cudaMap } = dockerMeta;
   // A variant may require a newer vLLM than the recipe baseline (e.g. the DSpark
   // checkpoint needs 0.25.0, currently nightly). Take the higher version and OR
   // the nightly flag so the Install block reflects the selected checkpoint.
@@ -2876,11 +2902,13 @@ uv pip install -U vllm --torch-backend auto`;
   // serves the model is rendered in the main command block below. A YAML
   // override at `model.install.docker.command` still wins for recipes that
   // need a custom build step. The CUDA-version selector (below, next to Copy)
-  // drives the tag suffix for NVIDIA; AMD / TPU pull a single image.
+  // drives the tag suffix for NVIDIA; AMD / TPU / XPU pull a single image.
   const defaultDockerCmd = `docker pull ${dockerImage}`;
   const dockerCmd = dockerCfg?.command || defaultDockerCmd;
   const defaultDockerNote = isTpu
     ? "TPU builds are published by vllm-project/tpu-inference. See the Trillium and Ironwood tpu-recipes for pinned image tags and exact deployment flags."
+    : isXpu
+      ? "Intel XPU (Arc/Battlemage) image. The entrypoint does not initialize oneAPI — source /opt/intel/oneapi/setvars.sh before `vllm serve`, or torch.xpu.device_count() returns 0."
     : isAmd
       ? undefined
       : cudaMap
@@ -2902,8 +2930,9 @@ uv pip install -U vllm --torch-backend auto`;
       (installMode === "pip" && nightlyRequired && !pipCfg?.command));
 
   // TPU has no pip wheel — force-hide the pip tab regardless of recipe overrides.
-  const effectivePipHidden = pipHidden || isTpu;
-  const dockerLabel = isTpu ? "Docker (TPU)" : isAmd ? "Docker (ROCm)" : "Docker";
+  // Intel XPU is validated via the official `vllm-openai-xpu` Docker image;
+  const effectivePipHidden = pipHidden || isTpu || isXpu;
+  const dockerLabel = isTpu ? "Docker (TPU)" : isXpu ? "Docker (XPU)" : isAmd ? "Docker (ROCm)" : "Docker";
   const tabs = [
     !effectivePipHidden && {
       id: "pip",
@@ -2931,7 +2960,7 @@ uv pip install -U vllm --torch-backend auto`;
         <Package size={12} className="text-[var(--command-fg)]/50 shrink-0" />
         <span className="text-[11px] font-semibold text-[var(--command-fg)]/70 uppercase tracking-widest">Install</span>
         <span className="text-[11px] text-[var(--command-fg)]/40 font-mono">
-          vLLM {minV}+{isOmni ? " · vLLM-Omni nightly" : ""} · {isTpu ? "TPU" : isAmd ? "ROCm" : "CUDA"}
+          vLLM {minV}+{isOmni ? " · vLLM-Omni nightly" : ""} · {isTpu ? "TPU" : isXpu ? "XPU" : isAmd ? "ROCm" : "CUDA"}
         </span>
         {nightlyRequired && (
           <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 uppercase tracking-wider">
@@ -3052,7 +3081,7 @@ function MultiNodeBlock({ result, verifyCmd, benchCmd, statusHeader, installMode
   const isDocker = installMode === "docker";
   const wrap = (cmd) =>
     isDocker
-      ? buildDockerRun({ command: cmd, env: result.env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+      ? buildDockerRun({ command: cmd, env: result.env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, isXpu: dockerMeta.isXpu })
       : cmd;
   const tabs = [
     { id: "head", label: "Head", command: wrap(result.headCommand) },
@@ -3110,7 +3139,7 @@ function PdClusterBlock({ result, verifyCmd, benchCmd, statusHeader, onRankChang
   // it stays as-is with its pip-install hint regardless of install mode.
   const wrap = (cmd, env) =>
     isDocker
-      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, isXpu: dockerMeta.isXpu })
       : cmd;
   // Mooncake composed into PD (result.mooncake): a "Mooncake Config" tab
   // (launch step 0) writes the shared config file(s) once — every
@@ -3244,7 +3273,7 @@ function KvStoreLbBlock({ result, verifyCmd, benchCmd, statusHeader, onInstanceC
   const isDocker = installMode === "docker";
   const wrap = (cmd, env) =>
     isDocker
-      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags })
+      ? buildDockerRun({ command: cmd, env, image: dockerMeta.image, gpuFlags: dockerMeta.gpuFlags, isXpu: dockerMeta.isXpu })
       : cmd;
 
   const instances = result.instances || 2;

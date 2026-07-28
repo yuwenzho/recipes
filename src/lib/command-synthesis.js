@@ -467,7 +467,8 @@ export function computeDockerMeta(recipe, variant, hwProfile, hwId = null) {
       };
   const isAmd = hwProfile?.brand === "AMD";
   const isTpu = hwProfile?.generation === "tpu";
-  const isIntel = hwProfile?.generation === "cpu" ||hwProfile?.brand === "Intel";
+  const isXpu = hwProfile?.generation === "xpu";
+  const isIntel = hwProfile?.generation === "cpu" || isXpu || hwProfile?.brand === "Intel";
   const brandKey = isTpu ? "tpu" : isAmd ? "amd" : isIntel ? "intel" : "nvidia";
   // Exact variant+hardware image overrides win over variant-wide and
   // model-wide images (for example, an MI355X-only ROCm nightly).
@@ -504,15 +505,20 @@ export function computeDockerMeta(recipe, variant, hwProfile, hwId = null) {
   // does not cover instead of skipping directly to the global default.
   applyOverride(recipe.model?.docker_image);
 
-  const image = pinned || DEFAULT_IMAGE[brandKey];
+  // Intel XPU (Arc Pro / Battlemage) ships in a dedicated image, not the CPU one.
+  const image = isXpu && !pinned
+    ? "vllm/vllm-openai-xpu:latest"
+    : pinned || DEFAULT_IMAGE[brandKey];
   const gpuFlags = isTpu
     ? "--privileged --network host \\\n  -v /dev/shm:/dev/shm"
     : isAmd
       ? "--device=/dev/kfd --device=/dev/dri \\\n  --security-opt seccomp=unconfined --group-add video"
+    : isXpu
+      ? "--device /dev/dri \\\n  -v /dev/dri/by-path:/dev/dri/by-path --shm-size=16g"
     : isIntel
       ? "--shm-size=16g"	
       : "--gpus all";
-  return { image, gpuFlags, brandKey, isAmd, isTpu, isIntel, pinned, cudaMap, nightlyRequired };
+  return { image, gpuFlags, brandKey, isAmd, isTpu, isXpu, isIntel, pinned, cudaMap, nightlyRequired };
 }
 
 // argv form of the brand-specific GPU flags from computeDockerMeta. Mirrors
@@ -527,6 +533,9 @@ function dockerGpuArgv(meta) {
       "--group-add", "video",
     ];
   }
+  if (meta.isXpu) {
+    return ["--device", "/dev/dri", "-v", "/dev/dri/by-path:/dev/dri/by-path", "--shm-size", "16g"];
+  }
   if (meta.isIntel) {
     return ["--shm-size", "16g"];
   }	
@@ -536,15 +545,22 @@ function dockerGpuArgv(meta) {
 // Wrap a `vllm serve MODEL <args>` command in `docker run`. The vllm/vllm-openai
 // image's entrypoint is `vllm serve`, so we pass MODEL and the trailing args as
 // CMD. Env vars become `-e KEY=VAL` inside the container.
-export function buildDockerRun({ command, env, image, gpuFlags, port = 8000 }) {
+export function buildDockerRun({ command, env, image, gpuFlags, port = 8000, isXpu = false }) {
   const envFlags = Object.entries(env || {})
     .map(([k, v]) => `-e ${k}=${v}`)
     .join(" \\\n  ");
   const modelId = command.match(/^vllm serve (\S+)/)?.[1] || "MODEL";
   const serveBody = command.replace(/^vllm serve \S+\s*\\?\n?\s*/, "");
-  return `docker run ${gpuFlags} \\
+  const base = `docker run ${gpuFlags} \\
   --privileged --ipc=host -p ${port}:${port} \\
-  -v ~/.cache/huggingface:/root/.cache/huggingface \\${envFlags ? `\n  ${envFlags} \\` : ""}
+  -v ~/.cache/huggingface:/root/.cache/huggingface \\${envFlags ? `\n  ${envFlags} \\` : ""}`;
+  if (isXpu) {
+    const serve = `vllm serve ${modelId}${serveBody ? ` \\\n  ${serveBody}` : ""}`;
+    return `${base}
+  --entrypoint bash ${image} \\
+  -c "source /opt/intel/oneapi/setvars.sh && exec ${serve}"`;
+  }
+  return `${base}
   ${image} ${modelId}${serveBody ? ` \\\n  ${serveBody}` : ""}`;
 }
 
@@ -559,13 +575,25 @@ export function buildDockerArgv({ argv, env, meta, port = 8000 }) {
   // `vllm serve <model> <...flags>` → CMD becomes `<model> <...flags>` since
   // the image's entrypoint is already `vllm serve`.
   const cmdArgs = argv[0] === "vllm" && argv[1] === "serve" ? argv.slice(2) : argv;
-  return [
+  const base = [
     "docker", "run",
     ...dockerGpuArgv(meta),
     "--privileged", "--ipc=host",
     "-p", `${port}:${port}`,
     "-v", "~/.cache/huggingface:/root/.cache/huggingface",
     ...envFlags,
+  ];
+  // Intel XPU: override entrypoint to source oneAPI before serving (see
+  // buildDockerRun). The full serve invocation becomes a single `bash -c` arg.
+  if (meta.isXpu) {
+    return [
+      ...base,
+      "--entrypoint", "bash", meta.image,
+      "-c", `source /opt/intel/oneapi/setvars.sh && exec vllm serve ${cmdArgs.join(" ")}`,
+    ];
+  }
+  return [
+    ...base,
     meta.image,
     ...cmdArgs,
   ];
