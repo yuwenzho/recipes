@@ -505,7 +505,7 @@ export function computeDockerMeta(recipe, variant, hwProfile, hwId = null) {
   // does not cover instead of skipping directly to the global default.
   applyOverride(recipe.model?.docker_image);
 
-  // Intel XPU (Arc Pro / Battlemage) ships in a dedicated image, not the CPU one.
+  // Intel XPU ships in a dedicated image, not the CPU one.
   const image = isXpu && !pinned
     ? "vllm/vllm-openai-xpu:latest"
     : pinned || DEFAULT_IMAGE[brandKey];
