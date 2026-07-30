@@ -12,6 +12,9 @@ meta:
   related_recipes:
     - "Qwen/Qwen3.5-4B"
     - "Qwen/Qwen3.5-0.8B"
+  hardware:
+    arc_pro_b60: verified
+    arc_pro_b70: verified
 
 model:
   model_id: "Qwen/Qwen3.5-2B"
@@ -54,7 +57,7 @@ variants:
   default:
     precision: bf16
     vram_minimum_gb: 5
-    description: "Full precision BF16 — fits on an 8 GB GPU"
+    description: "Full precision BF16 — fits on an 8 GB GPU or Intel XPU B60 / B70"
 
 compatible_strategies:
   - single_node_tp
@@ -74,7 +77,7 @@ guide: |
   ## Prerequisites
 
   - **vLLM version:** >= 0.17.0
-  - **Hardware:** single 8 GB GPU
+  - **Hardware:** single 8 GB GPU or Intel XPU B60 / B70
 
   ### Install vLLM
 
@@ -84,12 +87,30 @@ guide: |
   uv pip install -U vllm --torch-backend=auto
   ```
 
+  ### Docker
+  ```bash
+  docker pull vllm/vllm-openai-xpu:latest  # Intel XPU (B60 / B70)
+  ```
+
   ## Launching the Server
 
   ```bash
   vllm serve Qwen/Qwen3.5-2B \
     --max-model-len 262144 \
     --reasoning-parser qwen3
+  ```
+
+  ### Docker (Intel XPU B60 / B70)
+
+  ```bash
+  docker run --device /dev/dri \
+    -v /dev/dri/by-path:/dev/dri/by-path --shm-size=16g \
+    --privileged --ipc=host -p 8000:8000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --entrypoint bash vllm/vllm-openai-xpu:latest \
+    -c "source /opt/intel/oneapi/setvars.sh && exec vllm serve Qwen/Qwen3.5-2B \
+    --reasoning-parser qwen3 \
+    --enforce-eager"
   ```
 
   ## Client Usage

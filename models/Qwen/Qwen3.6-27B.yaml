@@ -14,6 +14,8 @@ meta:
   hardware:
     dgx_spark_gb10: verified
     rtx_pro_6000: verified
+    arc_pro_b60: verified
+    arc_pro_b70: verified
 
 model:
   model_id: "Qwen/Qwen3.6-27B"
@@ -61,7 +63,7 @@ variants:
   default:
     precision: bf16
     vram_minimum_gb: 65
-    description: "Full precision BF16 — fits on 1x H200 or 2x H100"
+    description: "Full precision BF16 — fits on 1x H200, 2x H100, or 4x Intel XPU B60 / B70"
     hardware_overrides:
       rtx_pro_6000:
         extra_args:
@@ -110,7 +112,7 @@ guide: |
 
   - **vLLM version:** >= 0.17.0
   - **DGX Spark NVFP4 vLLM version:** >= 0.24.0
-  - **Hardware (BF16):** 1x H200 or 2x H100
+  - **Hardware (BF16):** 1x H200, 2x H100, or 4x Intel XPU B60 / B70
   - **Hardware (FP8):** single 40 GB GPU (H100/H200/L40S)
   - **Hardware (Int4):** single 24 GB GPU
   - **Hardware (NVFP4):** single NVIDIA Blackwell GPU (B200/B300/GB10 DGX Spark)
@@ -121,6 +123,11 @@ guide: |
   uv venv
   source .venv/bin/activate
   uv pip install -U vllm --torch-backend=auto
+  ```
+
+  ### Docker
+  ```bash
+  docker pull vllm/vllm-openai-xpu:latest  # Intel XPU (B60 / B70)
   ```
 
   ## Launching the Server
@@ -226,6 +233,21 @@ guide: |
   vllm serve nvidia/Qwen3.6-27B-NVFP4 \
     --max-model-len 262144 \
     --reasoning-parser qwen3
+  ```
+
+  ### Docker (Intel XPU B60 / B70)
+
+  ```bash
+  docker run --device /dev/dri \
+    -v /dev/dri/by-path:/dev/dri/by-path --shm-size=16g \
+    --privileged --ipc=host -p 8000:8000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --entrypoint bash vllm/vllm-openai-xpu:latest \
+    -c "source /opt/intel/oneapi/setvars.sh && exec vllm serve Qwen/Qwen3.6-27B \
+    --reasoning-parser qwen3 \
+    --tensor-parallel-size 4 \
+    --max-model-len 8192 \
+    --enforce-eager"
   ```
 
   ## Processing Ultra-Long Texts
